@@ -93,6 +93,20 @@ jobs:
           ARMADA_LOCAL_PKGS=kernel "${JUST_BIN}" build localhost/armada latest
           podman image inspect localhost/armada:latest >/dev/null
 
+      - name: Load Armada container into rootful Podman
+        run: |
+          set -euxo pipefail
+          cd armada
+          podman save localhost/armada:latest -o /tmp/armada-image.tar
+          sudo podman load -i /tmp/armada-image.tar
+          sudo podman image inspect localhost/armada:latest >/dev/null
+          ROOTLESS_ID=$(podman image inspect localhost/armada:latest --format '{{.Id}}')
+          ROOTFUL_ID=$(sudo podman image inspect localhost/armada:latest --format '{{.Id}}')
+          echo "rootless image: ${ROOTLESS_ID}"
+          echo "rootful image:  ${ROOTFUL_ID}"
+          test "${ROOTLESS_ID}" = "${ROOTFUL_ID}"
+          rm -f /tmp/armada-image.tar
+
       - name: Build flashable disk image
         run: |
           set -euxo pipefail
