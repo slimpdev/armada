@@ -110,10 +110,64 @@ jobs:
       - name: Build flashable disk image
         run: |
           set -euxo pipefail
-          JUST_BIN=$(command -v just)
           cd armada
-          "${JUST_BIN}" build-armada-image localhost/armada latest
-          sudo chown -R "$(id -u):$(id -g)" output
+
+          # The stock `just build-armada-image` calls `_rootful_load_image`
+          # again. We already performed and verified the rootless -> rootful
+          # handoff above, so run the upstream BIB recipe directly here.
+          sudo rm -rf /var/tmp/podman[0-9]* /var/tmp/buildah-cache-[0-9]* || true
+          sudo rm -rf "${PWD}"/_build-bib.* || true
+          rm -rf output
+
+          BUILDTMP=$(mktemp -p "${PWD}" -d -t _build-bib.XXXXXXXXXX)
+          EXTRA_MOUNTS=()
+          if [ -d /etc/containers/containers.conf.d ]; then
+            EXTRA_MOUNTS+=("-v" "/etc/containers/containers.conf.d:/etc/containers/containers.conf.d:ro")
+          fi
+          if [ -f /tmp/armada-runc/runc-arm64 ]; then
+            EXTRA_MOUNTS+=("-v" "/tmp/armada-runc/runc-arm64:/usr/bin/runc:ro")
+          fi
+
+          echo "Starting bootc-image-builder; temporary output: ${BUILDTMP}"
+          sudo podman run \
+            --rm \
+            --privileged \
+            --pull=newer \
+            --net=host \
+            --platform linux/arm64 \
+            --security-opt label=type:unconfined_t \
+            --security-opt apparmor=unconfined \
+            --cap-add=CAP_MKNOD \
+            -v "${PWD}/disk_config/disk.toml:/config.toml:ro" \
+            -v "${BUILDTMP}:/output" \
+            -v /var/lib/containers/storage:/var/lib/containers/storage \
+            "${EXTRA_MOUNTS[@]}" \
+            quay.io/centos-bootc/bootc-image-builder:latest \
+            --type raw \
+            --use-librepo=True \
+            --rootfs=btrfs \
+            --target-arch arm64 \
+            localhost/armada:latest \
+            2>&1 | tee "${GITHUB_WORKSPACE}/bib-build.log"
+
+          sudo chown -R "$(id -u):$(id -g)" "${BUILDTMP}"
+          mkdir -p output
+          rm -rf output/image
+          mv -f "${BUILDTMP}"/* output/
+          rmdir "${BUILDTMP}"
+
+          test -f output/image/disk.raw
+          echo "Finalizing the freshly-built raw image..."
+          version=$(podman inspect -t image localhost/armada:latest \
+                    | jq -r '.[0].Config.Labels["org.opencontainers.image.version"] // empty')
+          ./post_process/preseed-flatpaks.sh output/image/disk.raw
+          ./post_process/make-bootimg.sh output/image/disk.raw
+          if [[ -n "${version}" && "${version}" != unknown ]]; then
+            export OUT="output/armada-${version}.img.gz"
+          fi
+          ./post_process/finalize-armada-image.sh output/image/disk.raw \
+            2>&1 | tee -a "${GITHUB_WORKSPACE}/bib-build.log"
+
           IMG=$(find output -maxdepth 1 -name 'armada-*.img.gz' -type f -print -quit)
           test -n "${IMG}"
           sha256sum "${IMG}" > "${IMG}.sha256"
@@ -132,6 +186,15 @@ jobs:
             echo 'cat /sys/module/mcu_joystick/parameters/trigger_confirm_frames'
             echo '```'
           } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: armada-konkr-build-log
+          path: bib-build.log
+          if-no-files-found: ignore
+          retention-days: 3
 
       - name: Upload test image
         uses: actions/upload-artifact@v4
