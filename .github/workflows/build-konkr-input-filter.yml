@@ -12,9 +12,14 @@ on:
         description: "armada-os/armada-packages ref to build against"
         type: string
         default: "main"
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/build-konkr-input-filter.yml
 
 permissions:
-  contents: read
+  contents: write
   packages: read
 
 concurrency:
@@ -35,14 +40,14 @@ jobs:
       - name: Checkout Armada test branch
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.armada_ref }}
+          ref: ${{ inputs.armada_ref || 'konkr-input-filter' }}
           path: armada
 
       - name: Checkout upstream armada-packages
         uses: actions/checkout@v4
         with:
           repository: armada-os/armada-packages
-          ref: ${{ inputs.packages_ref }}
+          ref: ${{ inputs.packages_ref || 'main' }}
           path: armada-packages
 
       - name: Install build tooling
@@ -114,6 +119,10 @@ jobs:
           cd armada
           sudo git config --global --add safe.directory "${GITHUB_WORKSPACE}/armada"
 
+          echo "Disk space before bootc-image-builder:"
+          df -h "${GITHUB_WORKSPACE}" /var/lib/containers || true
+          sudo podman system df || true
+
           # Match Armada's official build-disk workflow: run the whole disk
           # recipe as root. The local patched image is already present in
           # rootful Podman, so _rootful_load_image immediately accepts it.
@@ -123,13 +132,16 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" output
           IMG=$(find output -maxdepth 1 -name 'armada-*.img.gz' -type f -print -quit)
           test -n "${IMG}"
-          sha256sum "${IMG}" > "${IMG}.sha256"
+          (cd "$(dirname "${IMG}")" && sha256sum "$(basename "${IMG}")") > "${IMG}.sha256"
           ls -lh "${IMG}" "${IMG}.sha256"
+
+          echo "Disk space after image finalization:"
+          df -h "${GITHUB_WORKSPACE}" /var/lib/containers || true
           {
             echo "### KONKR input-filter test image"
             echo
-            echo "Armada ref: \`${{ inputs.armada_ref }}\`"
-            echo "armada-packages ref: \`${{ inputs.packages_ref }}\`"
+            echo "Armada ref: \`${{ inputs.armada_ref || 'konkr-input-filter' }}\`"
+            echo "armada-packages ref: \`${{ inputs.packages_ref || 'main' }}\`"
             echo "R3 debounce default: \`50 ms\`"
             echo "Trigger activation confirmation: \`2 frames\`"
             echo
@@ -140,22 +152,142 @@ jobs:
             echo '```'
           } >> "${GITHUB_STEP_SUMMARY}"
 
+      - name: Package image for GitHub Release
+        id: package
+        run: |
+          set -euo pipefail
+          IMG=$(find armada/output -maxdepth 1 -name 'armada-*.img.gz' -type f -print -quit)
+          test -n "${IMG}"
+
+          IMAGE_FILE=$(basename "${IMG}")
+          RELEASE_DIR="${GITHUB_WORKSPACE}/release"
+          mkdir -p "${RELEASE_DIR}"
+
+          # GitHub Release assets are limited to 2 GiB each. The image is
+          # already gzip-compressed, so split it directly at 1900 MiB without
+          # wasting runner space on another full-size archive.
+          split \
+            --bytes=1900M \
+            --numeric-suffixes=1 \
+            --suffix-length=3 \
+            "${IMG}" \
+            "${RELEASE_DIR}/${IMAGE_FILE}."
+
+          cp "${IMG}.sha256" "${RELEASE_DIR}/${IMAGE_FILE}.sha256"
+
+          shopt -s nullglob
+          PARTS=("${RELEASE_DIR}/${IMAGE_FILE}."[0-9][0-9][0-9])
+          test "${#PARTS[@]}" -ge 1
+          (
+            cd "${RELEASE_DIR}"
+            sha256sum "${PARTS[@]##*/}"
+          ) > "${RELEASE_DIR}/${IMAGE_FILE}.parts.sha256"
+
+          ARMADA_SHA=$(git -C armada rev-parse HEAD)
+          PACKAGES_SHA=$(git -C armada-packages rev-parse HEAD)
+          TAG="konkr-input-filter-r${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+          {
+            echo "Image: ${IMAGE_FILE}"
+            echo "Armada commit: ${ARMADA_SHA}"
+            echo "armada-packages commit: ${PACKAGES_SHA}"
+            echo "Workflow commit: ${GITHUB_SHA}"
+            echo "Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > "${RELEASE_DIR}/build-info.txt"
+
+          echo "image_file=${IMAGE_FILE}" >> "${GITHUB_OUTPUT}"
+          echo "armada_sha=${ARMADA_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "packages_sha=${PACKAGES_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+
+          echo "Release assets:"
+          ls -lh "${RELEASE_DIR}"
+
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.package.outputs.tag }}
+          IMAGE_FILE: ${{ steps.package.outputs.image_file }}
+          ARMADA_SHA: ${{ steps.package.outputs.armada_sha }}
+          PACKAGES_SHA: ${{ steps.package.outputs.packages_sha }}
+        run: |
+          set -euo pipefail
+
+          cat > release-notes.md <<EOF
+          Patched Armada OS test image for KONKR / AYANEO Pocket FIT Elite.
+
+          This build adds filtering for spurious R3 and trigger input events in the AYANEO MCU joystick driver.
+
+          Source commits:
+          - Armada: \`${ARMADA_SHA}\`
+          - armada-packages: \`${PACKAGES_SHA}\`
+
+          Download every numbered \`${IMAGE_FILE}.NNN\` part into the same directory. On Windows, select the \`.001\` part and use **7-Zip → Combine files**. On Linux or macOS, join the parts with:
+
+          \`cat "${IMAGE_FILE}".??? > "${IMAGE_FILE}"\`
+
+          Verify the joined \`${IMAGE_FILE}\` against \`${IMAGE_FILE}.sha256\`. The \`.parts.sha256\` file verifies the downloaded parts before joining.
+
+          This is an experimental prerelease intended for hardware testing.
+          EOF
+
+          API="${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}"
+          RELEASE_JSON=$(jq -n \
+            --arg tag "${RELEASE_TAG}" \
+            --arg target "${ARMADA_SHA}" \
+            --arg name "KONKR Pocket FIT Elite input-filter test ${RELEASE_TAG}" \
+            --rawfile body release-notes.md \
+            '{tag_name: $tag, target_commitish: $target, name: $name, body: $body, draft: true, prerelease: true}')
+
+          RESPONSE=$(curl --fail-with-body --silent --show-error \
+            --retry 3 --retry-all-errors \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "${API}/releases" \
+            -d "${RELEASE_JSON}")
+          RELEASE_ID=$(jq -er '.id' <<< "${RESPONSE}")
+
+          for asset in release/*; do
+            name=$(basename "${asset}")
+            encoded_name=$(jq -nr --arg value "${name}" '$value | @uri')
+            echo "Uploading ${name} ($(du -h "${asset}" | cut -f1))"
+            curl --fail-with-body --silent --show-error \
+              --retry 5 --retry-all-errors --retry-delay 5 \
+              -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@${asset}" \
+              "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?name=${encoded_name}" \
+              >/dev/null
+          done
+
+          # Keep the release hidden until every part has uploaded successfully.
+          PUBLISH_RESPONSE=$(curl --fail-with-body --silent --show-error \
+            --retry 3 --retry-all-errors \
+            -X PATCH \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "${API}/releases/${RELEASE_ID}" \
+            -d '{"draft":false,"prerelease":true}')
+          RELEASE_URL=$(jq -er '.html_url' <<< "${PUBLISH_RESPONSE}")
+          echo "Release: ${RELEASE_URL}" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Prepare build diagnostics
+        if: always()
+        run: |
+          if [ -f bib-build.log ]; then
+            tail -n 5000 bib-build.log > build-diagnostics.log
+          fi
+
       - name: Upload build diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: armada-konkr-build-log
-          path: bib-build.log
+          path: build-diagnostics.log
           if-no-files-found: ignore
           retention-days: 3
-
-      - name: Upload test image
-        uses: actions/upload-artifact@v4
-        with:
-          name: armada-konkr-input-filter
-          path: |
-            armada/output/armada-*.img.gz
-            armada/output/armada-*.img.gz.sha256
-          if-no-files-found: error
-          retention-days: 3
-          compression-level: 0
