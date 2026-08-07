@@ -66,29 +66,14 @@ jobs:
       - name: Install just
         uses: ublue-os/just-action@30ab4659369934b65b655bf8d2fa4ddd6547d384
 
-      - name: Inject KONKR input filter into kernel patch series
+      - name: Inject KONKR input filter into AYANEO MCU driver patch
         run: |
           set -euxo pipefail
-          PATCH=1301-input-mcu-joystick-filter-spurious-r3-trigger-spikes.patch
-          cp "armada/patches/konkr/${PATCH}" "armada-packages/kernel/patches/${PATCH}"
-          python3 - <<'PY'
-          from pathlib import Path
-
-          series = Path("armada-packages/kernel/patches/series")
-          needle = "0058-input-joystick-add-ayaneo-mcu-joystick.patch"
-          entry = "1301-input-mcu-joystick-filter-spurious-r3-trigger-spikes.patch"
-          lines = series.read_text().splitlines()
-          if entry not in lines:
-              try:
-                  pos = lines.index(needle) + 1
-              except ValueError:
-                  raise SystemExit(f"Could not find {needle} in kernel patch series")
-              lines.insert(pos, entry)
-              series.write_text("\n".join(lines) + "\n")
-          PY
-          echo "Patched series:"
-          grep -A3 -B2 '1301-input-mcu' armada-packages/kernel/patches/series
-          sha256sum "armada-packages/kernel/patches/${PATCH}"
+          TARGET="armada-packages/kernel/patches/0058-input-joystick-add-ayaneo-mcu-joystick.patch"
+          python3 armada/patches/konkr/inject-konkr-input-filter.py "${TARGET}"
+          grep -n -A4 -B3 'r3_debounce_ms' "${TARGET}"
+          grep -n -A8 -B3 'mcu_filter_trigger' "${TARGET}"
+          sha256sum "${TARGET}"
 
       - name: Build patched kernel package
         run: |
@@ -113,10 +98,6 @@ jobs:
           set -euxo pipefail
           JUST_BIN=$(command -v just)
           cd armada
-          # Run just as the normal runner user. Its _rootful_load_image helper
-          # copies localhost/armada from rootless storage into rootful podman
-          # before bootc-image-builder runs; invoking the whole recipe via sudo
-          # would skip that copy for localhost images.
           "${JUST_BIN}" build-armada-image localhost/armada latest
           sudo chown -R "$(id -u):$(id -g)" output
           IMG=$(find output -maxdepth 1 -name 'armada-*.img.gz' -type f -print -quit)
