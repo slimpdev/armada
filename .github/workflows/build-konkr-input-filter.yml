@@ -113,8 +113,11 @@ jobs:
           set -euxo pipefail
           JUST_BIN=$(command -v just)
           cd armada
-          sudo git config --global --add safe.directory "${GITHUB_WORKSPACE}/armada"
-          sudo "${JUST_BIN}" build-armada-image localhost/armada latest
+          # Run just as the normal runner user. Its _rootful_load_image helper
+          # copies localhost/armada from rootless storage into rootful podman
+          # before bootc-image-builder runs; invoking the whole recipe via sudo
+          # would skip that copy for localhost images.
+          "${JUST_BIN}" build-armada-image localhost/armada latest
           sudo chown -R "$(id -u):$(id -g)" output
           IMG=$(find output -maxdepth 1 -name 'armada-*.img.gz' -type f -print -quit)
           test -n "${IMG}"
