@@ -1,0 +1,147 @@
+---
+name: Build KONKR input-filter test image
+
+on:
+  workflow_dispatch:
+    inputs:
+      armada_ref:
+        description: "Armada branch/ref containing the KONKR patch"
+        type: string
+        default: "konkr-input-filter"
+      packages_ref:
+        description: "armada-os/armada-packages ref to build against"
+        type: string
+        default: "main"
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: konkr-input-filter-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build patched KONKR Pocket FIT Elite image
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Maximize build space
+        uses: ublue-os/remove-unwanted-software@cc0becac701cf642c8f0a6613bbdaf5dc36b259e
+        with:
+          remove-codeql: true
+
+      - name: Checkout Armada test branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.armada_ref }}
+          path: armada
+
+      - name: Checkout upstream armada-packages
+        uses: actions/checkout@v4
+        with:
+          repository: armada-os/armada-packages
+          ref: ${{ inputs.packages_ref }}
+          path: armada-packages
+
+      - name: Install build tooling
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            buildah \
+            ccache \
+            containernetworking-plugins \
+            curl \
+            git \
+            jq \
+            pigz \
+            podman \
+            python3 \
+            runc
+          mkdir -p ~/.config/containers
+          printf '[engine]\nruntime = "runc"\n' > ~/.config/containers/containers.conf
+
+      - name: Install just
+        uses: ublue-os/just-action@30ab4659369934b65b655bf8d2fa4ddd6547d384
+
+      - name: Inject KONKR input filter into kernel patch series
+        run: |
+          set -euxo pipefail
+          PATCH=1301-input-mcu-joystick-filter-spurious-r3-trigger-spikes.patch
+          cp "armada/patches/konkr/${PATCH}" "armada-packages/kernel/patches/${PATCH}"
+          python3 - <<'PY'
+          from pathlib import Path
+
+          series = Path("armada-packages/kernel/patches/series")
+          needle = "0058-input-joystick-add-ayaneo-mcu-joystick.patch"
+          entry = "1301-input-mcu-joystick-filter-spurious-r3-trigger-spikes.patch"
+          lines = series.read_text().splitlines()
+          if entry not in lines:
+              try:
+                  pos = lines.index(needle) + 1
+              except ValueError:
+                  raise SystemExit(f"Could not find {needle} in kernel patch series")
+              lines.insert(pos, entry)
+              series.write_text("\n".join(lines) + "\n")
+          PY
+          echo "Patched series:"
+          grep -A3 -B2 '1301-input-mcu' armada-packages/kernel/patches/series
+          sha256sum "armada-packages/kernel/patches/${PATCH}"
+
+      - name: Build patched kernel package
+        run: |
+          set -euxo pipefail
+          JUST_BIN=$(command -v just)
+          cd armada-packages
+          REGISTRY=localhost/armada-packages "${JUST_BIN}" image kernel
+          podman image inspect localhost/armada-packages/kernel:latest >/dev/null
+          echo "Patched kernel carrier image built successfully."
+
+      - name: Build Armada container with patched kernel
+        run: |
+          set -euxo pipefail
+          JUST_BIN=$(command -v just)
+          cd armada
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}/armada"
+          ARMADA_LOCAL_PKGS=kernel "${JUST_BIN}" build localhost/armada latest
+          podman image inspect localhost/armada:latest >/dev/null
+
+      - name: Build flashable disk image
+        run: |
+          set -euxo pipefail
+          JUST_BIN=$(command -v just)
+          cd armada
+          sudo git config --global --add safe.directory "${GITHUB_WORKSPACE}/armada"
+          sudo "${JUST_BIN}" build-armada-image localhost/armada latest
+          sudo chown -R "$(id -u):$(id -g)" output
+          IMG=$(find output -maxdepth 1 -name 'armada-*.img.gz' -type f -print -quit)
+          test -n "${IMG}"
+          sha256sum "${IMG}" > "${IMG}.sha256"
+          ls -lh "${IMG}" "${IMG}.sha256"
+          {
+            echo "### KONKR input-filter test image"
+            echo
+            echo "Armada ref: \`${{ inputs.armada_ref }}\`"
+            echo "armada-packages ref: \`${{ inputs.packages_ref }}\`"
+            echo "R3 debounce default: \`50 ms\`"
+            echo "Trigger activation confirmation: \`2 frames\`"
+            echo
+            echo "After boot, verify with:"
+            echo '```bash'
+            echo 'cat /sys/module/mcu_joystick/parameters/r3_debounce_ms'
+            echo 'cat /sys/module/mcu_joystick/parameters/trigger_confirm_frames'
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload test image
+        uses: actions/upload-artifact@v4
+        with:
+          name: armada-konkr-input-filter
+          path: |
+            armada/output/armada-*.img.gz
+            armada/output/armada-*.img.gz.sha256
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
