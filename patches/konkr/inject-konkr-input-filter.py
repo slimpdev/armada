@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from pathlib import Path
+import re
 import sys
 
 if len(sys.argv) != 2:
@@ -168,5 +169,25 @@ replace_once(
     "idle reset",
 )
 
+# 0058 creates mcu_joystick.c as one giant new-file hunk. Since we inserted
+# lines into that hunk, update its +line count or GNU patch will reject the
+# otherwise-correct payload as malformed.
+marker = "diff --git a/drivers/input/joystick/mcu_joystick.c b/drivers/input/joystick/mcu_joystick.c\n"
+start = text.find(marker)
+if start < 0:
+    raise SystemExit("mcu_joystick.c diff marker not found")
+section = text[start:]
+match = re.search(r"^@@ -0,0 \+1,(\d+) @@.*$", section, re.MULTILINE)
+if not match:
+    raise SystemExit("mcu_joystick.c new-file hunk header not found")
+hunk_start = match.end() + 1
+next_diff = section.find("\ndiff --git ", hunk_start)
+hunk_body = section[hunk_start:] if next_diff < 0 else section[hunk_start:next_diff]
+new_count = sum(1 for line in hunk_body.splitlines() if line.startswith("+"))
+old_header = match.group(0)
+new_header = re.sub(r"\+1,\d+", f"+1,{new_count}", old_header)
+section = section[:match.start()] + new_header + section[match.end():]
+text = text[:start] + section
+
 path.write_text(text)
-print(f"Injected KONKR input filter into {path}")
+print(f"Injected KONKR input filter into {path}; mcu_joystick.c hunk now has {new_count} lines")
