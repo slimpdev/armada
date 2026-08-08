@@ -9,14 +9,9 @@ on:
         type: string
         default: "konkr-input-filter"
       packages_ref:
-        description: "armada-os/armada-packages ref to build against"
+        description: "slimpdev/armada-packages branch/ref from PR #31"
         type: string
-        default: "main"
-  push:
-    branches:
-      - main
-    paths:
-      - .github/workflows/build-konkr-input-filter.yml
+        default: "agent/konkr-input-filter"
 
 permissions:
   contents: write
@@ -43,11 +38,11 @@ jobs:
           ref: ${{ inputs.armada_ref || 'konkr-input-filter' }}
           path: armada
 
-      - name: Checkout upstream armada-packages
+      - name: Checkout patched armada-packages fork
         uses: actions/checkout@v4
         with:
-          repository: armada-os/armada-packages
-          ref: ${{ inputs.packages_ref || 'main' }}
+          repository: slimpdev/armada-packages
+          ref: ${{ inputs.packages_ref || 'agent/konkr-input-filter' }}
           path: armada-packages
 
       - name: Install build tooling
@@ -71,13 +66,14 @@ jobs:
       - name: Install just
         uses: ublue-os/just-action@30ab4659369934b65b655bf8d2fa4ddd6547d384
 
-      - name: Inject KONKR input filter into AYANEO MCU driver patch
+      - name: Verify Pocket FIT Elite armada-packages source
         run: |
           set -euxo pipefail
           TARGET="armada-packages/kernel/patches/0058-input-joystick-add-ayaneo-mcu-joystick.patch"
-          python3 armada/patches/konkr/inject-konkr-input-filter.py "${TARGET}"
+          PACKAGES_SHA=$(git -C armada-packages rev-parse HEAD)
+          echo "armada-packages commit: ${PACKAGES_SHA}"
+          grep -n -A3 -B3 'of_machine_is_compatible("konkr,pocket-fit-elite")' "${TARGET}"
           grep -n -A4 -B3 'r3_debounce_ms' "${TARGET}"
-          grep -n -A8 -B3 'mcu_filter_trigger' "${TARGET}"
           sha256sum "${TARGET}"
 
       - name: Build patched kernel package
@@ -141,7 +137,7 @@ jobs:
             echo "### KONKR input-filter test image"
             echo
             echo "Armada ref: \`${{ inputs.armada_ref || 'konkr-input-filter' }}\`"
-            echo "armada-packages ref: \`${{ inputs.packages_ref || 'main' }}\`"
+            echo "armada-packages ref: \`${{ inputs.packages_ref || 'agent/konkr-input-filter' }}\`"
             echo "R3 debounce default: \`50 ms\`"
             echo "Trigger activation confirmation: \`2 frames\`"
             echo
